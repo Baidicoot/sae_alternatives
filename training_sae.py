@@ -242,7 +242,7 @@ if __name__ == "__main__":
         model_names=model_names,
         tokenizer=AutoTokenizer.from_pretrained("EleutherAI/pythia-1.4b"),
         model_kwargs=model_kwargs,
-        dataset_name="Elriggs/openwebtext-100k",
+        dataset_name="monology/pile-uncopyrighted",
         device=device,
         num_epochs=10,
         num_cache_epochs=1,
