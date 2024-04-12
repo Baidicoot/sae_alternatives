@@ -1,4 +1,4 @@
-from modelling_sae import BasicSAE, RICA, UntiedRICA, ShrinkageRICA, ConstrainedRICA, SoftplusSAE, NonNegativeRICA
+from modelling_sae import *
 from cache_transformer_activations import cache_transformer_activations, ActivationCache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
@@ -103,6 +103,7 @@ def train_on_cache(
         loss_running_mean = [0 for _ in models]
         mse_running_mean = [0 for _ in models]
         l1_running_mean = [0 for _ in models]
+        kurtosis_running_mean = [0 for _ in models]
 
         cache_running_mean = torch.zeros_like(cache.activations[layer][0][0]).to(device)
         mse_scale_running_mean = 0
@@ -135,15 +136,16 @@ def train_on_cache(
             for model_idx, (model, optimizer, scheduler, name) in enumerate(zip(models, optimizers, schedulers, model_names)):
                 def step():
                     optimizer.zero_grad()
-                    loss, mse, l1, h, x_hat = model(current_batch)
+                    loss, h, x_hat = model(current_batch)
                     loss.backward()
                     optimizer.step()
                     scheduler.step()
 
                     loss_running_mean[model_idx] += loss.item()
-                    mse_running_mean[model_idx] += mse.item()
+                    mse_running_mean[model_idx] += (current_batch - x_hat).pow(2).mean().item()
                     sparsity_running_mean[model_idx] += (h.abs() > 0).float().sum(dim=-1).mean().item()
-                    l1_running_mean[model_idx] += l1.item()
+                    l1_running_mean[model_idx] += h.abs().mean().item()
+                    kurtosis_running_mean[model_idx] += (h.pow(4).mean(dim=0) / h.pow(2).mean(dim=0).pow(2)).mean().item()
 
                     metrics[name] = {}
 
@@ -158,9 +160,13 @@ def train_on_cache(
                         metrics[name]["lr"] = optimizer.param_groups[0]["lr"]
                         l1_running_mean[model_idx] /= log_loss_interval
                         metrics[name]["l1"] = l1_running_mean[model_idx]
+                        kurtosis_running_mean[model_idx] /= log_loss_interval
+                        metrics[name]["kurtosis"] = kurtosis_running_mean[model_idx]
                         loss_running_mean[model_idx] = 0
                         mse_running_mean[model_idx] = 0
                         sparsity_running_mean[model_idx] = 0
+                        l1_running_mean[model_idx] = 0
+                        kurtosis_running_mean[model_idx] = 0
                 
                 step()
 
@@ -182,10 +188,12 @@ def interleave_training_and_generation(
     device: str = "cuda",
     num_epochs: int = 1,
     num_cache_epochs: int = 1,
+    cache_size: int = 50_000_000,
     sample_batch_size: int = 128,
     sample_max_length: int = 512,
     train_batch_size: int = 4096,
     log_interval: int = 10,
+    save_every: int = 10,
     layer: int = 8,
 ):
     wandb.init(project="sae_alternatives", entity="baidicoot")
@@ -217,7 +225,7 @@ def interleave_training_and_generation(
             batch_size=sample_batch_size,
             output_batch_size=train_batch_size,
             truncate_length=sample_max_length,
-            min_num_activations=10_000_000,
+            min_num_activations=cache_size,
             p_sample=1,
             device=device,
         )
@@ -241,12 +249,13 @@ def interleave_training_and_generation(
         )
 
         # save the models
-        print("Saving.")
-        for model, name in zip(models, model_names):
-            os.makedirs("models", exist_ok=True)
-            os.makedirs(f"models/epoch_{epoch}", exist_ok=True)
-            torch.save(model.state_dict(), f"models/epoch_{epoch}/{name}.pt")
-        
+        if (epoch + 1) % save_every == 0:
+            print("Saving.")
+            for model, name in zip(models, model_names):
+                os.makedirs("models", exist_ok=True)
+                os.makedirs(f"models/epoch_{epoch}", exist_ok=True)
+                torch.save(model.state_dict(), f"models/epoch_{epoch}/{name}.pt")
+            
         total_processed_sentences += processed_sentences
 
         if total_processed_sentences >= len(dataset):
@@ -258,20 +267,24 @@ def interleave_training_and_generation(
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    l1_alphas = [1e-5, 1e-3, 1e-1]
+    l1_alphas = np.logspace(-12, -8, 5)
 
-    hidden_size = 2048
-    ratio = 16
+    hidden_size = 1024
+    ratio = 4
 
     models = [
-        UntiedRICA(hidden_size, hidden_size * ratio, alpha) for alpha in l1_alphas
-    ] + [
-        RICA(hidden_size, hidden_size * ratio, alpha) for alpha in l1_alphas
+        KurtosisICA(
+            d_in=hidden_size,
+            d_hidden=hidden_size * ratio,
+            alpha=alpha,
+            nonneg=True,
+        )
+        for alpha in l1_alphas
     ]
 
     models = [model.to(device) for model in models]
 
-    optimizers = [torch.optim.Adam(model.parameters(), lr=4e-4) for model in models]
+    optimizers = [torch.optim.Adam(model.parameters(), lr=3e-4) for model in models]
 
     # linear warmup
     def linear_warmup(num_warmup_steps):
@@ -293,18 +306,16 @@ if __name__ == "__main__":
         return f
 
     schedulers = [
-        torch.optim.lr_scheduler.LambdaLR(optimizer, linear_warmup_cooldown(1000, 100_000))
+        torch.optim.lr_scheduler.LambdaLR(optimizer, linear_warmup_cooldown(1000, 200_000))
         for optimizer in optimizers
     ]
 
     model_names = [
-        f"UntiedRICA_{alpha:.2e}" for alpha in l1_alphas
-    ] + [
-        f"RICA_{alpha:.2e}" for alpha in l1_alphas
+        f"KurtosisICA_{alpha:.2e}" for alpha in l1_alphas
     ]
 
     model_kwargs = {
-        "pretrained_model_name_or_path": "EleutherAI/pythia-1.4b",
+        "pretrained_model_name_or_path": "EleutherAI/pythia-410m",
         "torch_dtype": torch.bfloat16,
         "token": hf_token,
     }
@@ -314,14 +325,16 @@ if __name__ == "__main__":
         optimizers=optimizers,
         schedulers=schedulers,
         model_names=model_names,
-        tokenizer=AutoTokenizer.from_pretrained("EleutherAI/pythia-1.4b"),
+        tokenizer=AutoTokenizer.from_pretrained("EleutherAI/pythia-410m"),
         model_kwargs=model_kwargs,
         dataset_name="Elriggs/openwebtext-100k",
         device=device,
-        num_epochs=10,
+        num_epochs=100,
         num_cache_epochs=1,
-        sample_batch_size=32,
+        cache_size=10_000_000,
+        sample_batch_size=64,
         sample_max_length=256,
         train_batch_size=4096,
-        layer=16,
+        save_every=10,
+        layer=4,
     )
